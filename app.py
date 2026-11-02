@@ -77,6 +77,32 @@ def count_per_class(directory, classes):
     return counts
 
 
+def counts_from_split_csv(classes):
+    """Fallback: hitung jumlah gambar dari split.csv (hasil notebook)."""
+    for p in ("split.csv", "output/split.csv"):
+        if os.path.exists(p):
+            df = pd.read_csv(p)
+            tr = df[df["split"] == "train"]["label"].value_counts()
+            te = df[df["split"] == "test"]["label"].value_counts()
+            return ({c: int(tr.get(c, 0)) for c in classes},
+                    {c: int(te.get(c, 0)) for c in classes})
+    return {}, {}
+
+
+def labels_from_saved_cm():
+    """Fallback: rekonstruksi y_true/y_pred dari confusion_matrix.npy."""
+    for p in ("confusion_matrix.npy", "output/confusion_matrix.npy"):
+        if os.path.exists(p):
+            cm = np.load(p)
+            yt, yp = [], []
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    yt += [i] * int(cm[i, j])
+                    yp += [j] * int(cm[i, j])
+            return np.array(yt), np.array(yp)
+    return None, None
+
+
 @st.cache_resource(show_spinner="Memuat model...")
 def load_model(path):
     from tensorflow.keras.models import load_model as _load
@@ -208,6 +234,8 @@ with tab1:
     st.subheader("Ringkasan Dataset")
     train_counts = count_per_class(train_dir, classes) if os.path.isdir(train_dir) else {}
     test_counts = count_per_class(test_dir, classes) if os.path.isdir(test_dir) else {}
+    if not train_counts and not test_counts:
+        train_counts, test_counts = counts_from_split_csv(classes)
     n_train, n_test = sum(train_counts.values()), sum(test_counts.values())
     total = n_train + n_test
 
@@ -330,106 +358,108 @@ with tab2:
 # ----------------------------------------------------------------------------
 with tab3:
     st.subheader("Evaluasi Model pada Data Uji")
-    if model is None:
-        st.warning("Model belum dimuat. Periksa path model di sidebar.")
-    elif not os.path.isdir(test_dir):
-        st.warning("Folder data uji tidak ditemukan.")
-    else:
+    y_true = y_pred = None
+    if model is not None and os.path.isdir(test_dir):
         y_true, y_pred = evaluate_on_test(
             model, os.path.getmtime(model_path), test_dir,
             tuple(classes), img_size, channels, rescale,
         )
-        if y_true is None:
-            st.warning("Tidak ada gambar pada folder data uji.")
-        else:
-            labels = list(range(len(classes)))
-            cm = confusion_matrix(y_true, y_pred, labels=labels)
+    if y_true is None:
+        y_true, y_pred = labels_from_saved_cm()
+        if y_true is not None:
+            st.caption("Menampilkan hasil evaluasi tersimpan dari notebook "
+                       "(folder data uji tidak tersedia di server).")
+    if y_true is None:
+        st.warning("Tidak ada gambar pada folder data uji.")
+    else:
+        labels = list(range(len(classes)))
+        cm = confusion_matrix(y_true, y_pred, labels=labels)
 
-            # Confusion matrix
-            st.markdown("#### Confusion Matrix")
-            cm_norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
-            g1, g2 = st.columns(2)
-            for col, mat, ttl, fmt in (
-                (g1, cm, "Confusion Matrix (jumlah)", "d"),
-                (g2, cm_norm, "Confusion Matrix (dinormalisasi per baris)", ".2f"),
-            ):
-                fig, ax = plt.subplots(figsize=(6.5, 5.5))
-                im = ax.imshow(mat, cmap="Blues")
-                ax.set_xticks(labels); ax.set_yticks(labels)
-                ax.set_xticklabels(classes, rotation=45, ha="right")
-                ax.set_yticklabels(classes)
-                ax.set(xlabel="Prediksi", ylabel="Label sebenarnya", title=ttl)
-                thr = mat.max() / 2
-                for i in labels:
-                    for j in labels:
-                        ax.text(j, i, format(mat[i, j], fmt), ha="center", va="center",
-                                fontsize=8, color="white" if mat[i, j] > thr else "black")
-                fig.colorbar(im, ax=ax, fraction=0.046)
-                fig.tight_layout()
-                col.pyplot(fig)
+        # Confusion matrix
+        st.markdown("#### Confusion Matrix")
+        cm_norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+        g1, g2 = st.columns(2)
+        for col, mat, ttl, fmt in (
+            (g1, cm, "Confusion Matrix (jumlah)", "d"),
+            (g2, cm_norm, "Confusion Matrix (dinormalisasi per baris)", ".2f"),
+        ):
+            fig, ax = plt.subplots(figsize=(6.5, 5.5))
+            im = ax.imshow(mat, cmap="Blues")
+            ax.set_xticks(labels); ax.set_yticks(labels)
+            ax.set_xticklabels(classes, rotation=45, ha="right")
+            ax.set_yticklabels(classes)
+            ax.set(xlabel="Prediksi", ylabel="Label sebenarnya", title=ttl)
+            thr = mat.max() / 2
+            for i in labels:
+                for j in labels:
+                    ax.text(j, i, format(mat[i, j], fmt), ha="center", va="center",
+                            fontsize=8, color="white" if mat[i, j] > thr else "black")
+            fig.colorbar(im, ax=ax, fraction=0.046)
+            fig.tight_layout()
+            col.pyplot(fig)
 
-            recall_cls = np.diag(cm_norm)
-            best, worst = int(recall_cls.argmax()), int(recall_cls.argmin())
-            off = cm.copy(); np.fill_diagonal(off, 0)
-            ti, tj = np.unravel_index(off.argmax(), off.shape)
-            st.info(
-                f"**Analisis:** Diagonal utama menunjukkan prediksi benar. Kelas yang paling "
-                f"baik dikenali adalah **{classes[best]}** (recall {recall_cls[best]:.1%}), "
-                f"sedangkan yang paling sulit adalah **{classes[worst]}** "
-                f"(recall {recall_cls[worst]:.1%}). Kesalahan terbanyak: gambar "
-                f"**{classes[ti]}** diprediksi sebagai **{classes[tj]}** sebanyak "
-                f"{off[ti, tj]} kali — kemungkinan karena kedua kelas mirip secara "
-                "visual atau jumlah data salah satu kelas kurang."
-            )
+        recall_cls = np.diag(cm_norm)
+        best, worst = int(recall_cls.argmax()), int(recall_cls.argmin())
+        off = cm.copy(); np.fill_diagonal(off, 0)
+        ti, tj = np.unravel_index(off.argmax(), off.shape)
+        st.info(
+            f"**Analisis:** Diagonal utama menunjukkan prediksi benar. Kelas yang paling "
+            f"baik dikenali adalah **{classes[best]}** (recall {recall_cls[best]:.1%}), "
+            f"sedangkan yang paling sulit adalah **{classes[worst]}** "
+            f"(recall {recall_cls[worst]:.1%}). Kesalahan terbanyak: gambar "
+            f"**{classes[ti]}** diprediksi sebagai **{classes[tj]}** sebanyak "
+            f"{off[ti, tj]} kali — kemungkinan karena kedua kelas mirip secara "
+            "visual atau jumlah data salah satu kelas kurang."
+        )
 
-            # Metrik
-            st.markdown("#### Metrik Evaluasi")
-            acc = accuracy_score(y_true, y_pred)
-            p_m, r_m, f_m, _ = precision_recall_fscore_support(
-                y_true, y_pred, average="macro", zero_division=0)
-            p_w, r_w, f_w, _ = precision_recall_fscore_support(
-                y_true, y_pred, average="weighted", zero_division=0)
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Accuracy", f"{acc:.2%}")
-            m2.metric("Precision (macro)", f"{p_m:.2%}")
-            m3.metric("Recall (macro)", f"{r_m:.2%}")
-            m4.metric("F1-score (macro)", f"{f_m:.2%}")
-            st.caption(f"Weighted avg → Precision {p_w:.2%} | Recall {r_w:.2%} | F1 {f_w:.2%}")
+        # Metrik
+        st.markdown("#### Metrik Evaluasi")
+        acc = accuracy_score(y_true, y_pred)
+        p_m, r_m, f_m, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="macro", zero_division=0)
+        p_w, r_w, f_w, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="weighted", zero_division=0)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Accuracy", f"{acc:.2%}")
+        m2.metric("Precision (macro)", f"{p_m:.2%}")
+        m3.metric("Recall (macro)", f"{r_m:.2%}")
+        m4.metric("F1-score (macro)", f"{f_m:.2%}")
+        st.caption(f"Weighted avg → Precision {p_w:.2%} | Recall {r_w:.2%} | F1 {f_w:.2%}")
 
-            rep = classification_report(
-                y_true, y_pred, labels=labels, target_names=classes,
-                output_dict=True, zero_division=0)
-            df_rep = pd.DataFrame(rep).T.drop(index=["accuracy"], errors="ignore")
-            df_rep["support"] = df_rep["support"].astype(int)
-            st.dataframe(
-                df_rep.style.format({"precision": "{:.2%}", "recall": "{:.2%}", "f1-score": "{:.2%}"}),
-                use_container_width=True,
-            )
+        rep = classification_report(
+            y_true, y_pred, labels=labels, target_names=classes,
+            output_dict=True, zero_division=0)
+        df_rep = pd.DataFrame(rep).T.drop(index=["accuracy"], errors="ignore")
+        df_rep["support"] = df_rep["support"].astype(int)
+        st.dataframe(
+            df_rep.style.format({"precision": "{:.2%}", "recall": "{:.2%}", "f1-score": "{:.2%}"}),
+            use_container_width=True,
+        )
 
-            per = df_rep.loc[classes]
-            fig, ax = plt.subplots(figsize=(9, 4))
-            x = np.arange(len(classes)); w = 0.27
-            ax.bar(x - w, per["precision"], w, label="Precision")
-            ax.bar(x, per["recall"], w, label="Recall")
-            ax.bar(x + w, per["f1-score"], w, label="F1-score")
-            ax.set_xticks(x); ax.set_xticklabels(classes, rotation=30, ha="right")
-            ax.set(ylim=(0, 1.05), title="Metrik per Kelas")
-            ax.legend(); ax.grid(axis="y", alpha=.3)
-            st.pyplot(fig)
+        per = df_rep.loc[classes]
+        fig, ax = plt.subplots(figsize=(9, 4))
+        x = np.arange(len(classes)); w = 0.27
+        ax.bar(x - w, per["precision"], w, label="Precision")
+        ax.bar(x, per["recall"], w, label="Recall")
+        ax.bar(x + w, per["f1-score"], w, label="F1-score")
+        ax.set_xticks(x); ax.set_xticklabels(classes, rotation=30, ha="right")
+        ax.set(ylim=(0, 1.05), title="Metrik per Kelas")
+        ax.legend(); ax.grid(axis="y", alpha=.3)
+        st.pyplot(fig)
 
-            bf = per["f1-score"].idxmax(); wf = per["f1-score"].idxmin()
-            gap_mw = abs(f_m - f_w)
-            st.info(
-                f"**Analisis:** Accuracy keseluruhan **{acc:.2%}**. F1 terbaik pada kelas "
-                f"**{bf}** ({per.loc[bf, 'f1-score']:.2%}) dan terendah pada **{wf}** "
-                f"({per.loc[wf, 'f1-score']:.2%}). "
-                + ("Selisih macro dan weighted F1 kecil, artinya performa merata antar kelas."
-                   if gap_mw < 0.03 else
-                   f"Selisih macro vs weighted F1 {gap_mw:.1%} menandakan performa tidak merata "
-                   "— kelas dengan data banyak mendominasi skor.")
-                + " Precision rendah berarti banyak salah tebak ke kelas tersebut; recall rendah "
-                  "berarti banyak sampel kelas tersebut terlewat."
-            )
+        bf = per["f1-score"].idxmax(); wf = per["f1-score"].idxmin()
+        gap_mw = abs(f_m - f_w)
+        st.info(
+            f"**Analisis:** Accuracy keseluruhan **{acc:.2%}**. F1 terbaik pada kelas "
+            f"**{bf}** ({per.loc[bf, 'f1-score']:.2%}) dan terendah pada **{wf}** "
+            f"({per.loc[wf, 'f1-score']:.2%}). "
+            + ("Selisih macro dan weighted F1 kecil, artinya performa merata antar kelas."
+               if gap_mw < 0.03 else
+               f"Selisih macro vs weighted F1 {gap_mw:.1%} menandakan performa tidak merata "
+               "— kelas dengan data banyak mendominasi skor.")
+            + " Precision rendah berarti banyak salah tebak ke kelas tersebut; recall rendah "
+              "berarti banyak sampel kelas tersebut terlewat."
+        )
 
 # ----------------------------------------------------------------------------
 # 7. Upload gambar & prediksi real-time
